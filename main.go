@@ -2,6 +2,7 @@ package main
 
 import (
 	"github.com/fsnotify/fsnotify"
+	_ "github.com/gorilla/websocket"
 	"html"
 	"log"
 	"net/http"
@@ -48,7 +49,7 @@ func main() {
 
 func server() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Got http request for: " + html.EscapeString(r.URL.Path))
+		log.Printf("[HTTP] %s %s\n", r.Method, html.EscapeString(r.URL.Path))
 
 		path := r.URL.Path[1:]
 		if path == "" {
@@ -59,6 +60,7 @@ func server() {
 		fn := "./html/" + path
 		if _, err := os.Stat(fn); err == nil {
 			// serve static content
+			log.Printf("[OK] Serving static file '%s'\n", fn)
 			http.ServeFile(w, r, fn)
 			return
 		}
