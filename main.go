@@ -2,7 +2,7 @@ package main
 
 import (
 	"github.com/fsnotify/fsnotify"
-	_ "github.com/gorilla/websocket"
+	"github.com/gorilla/websocket"
 	"html"
 	"log"
 	"net/http"
@@ -47,7 +47,40 @@ func main() {
 	<-done
 }
 
+var upgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 1024,
+}
+
 func server() {
+	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		log.Printf("[HTTP] %s %s\n", r.Method, html.EscapeString(r.URL.Path))
+
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Println("WebSocket upgrade error:")
+			log.Println(err)
+			return
+		}
+
+		go func() {
+			for {
+				messageType, p, err := conn.ReadMessage()
+				if err != nil {
+					log.Println("WebSocket read error:")
+					log.Println(err)
+					return
+				}
+
+				if err = conn.WriteMessage(messageType, p); err != nil {
+					log.Println("WebSocket write error:")
+					log.Println(err)
+					return
+				}
+			}
+		}()
+	})
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HTTP] %s %s\n", r.Method, html.EscapeString(r.URL.Path))
 
@@ -70,8 +103,9 @@ func server() {
 	})
 
 	go func() {
-		log.Println("Starting server...")
-		http.ListenAndServe(":8080", nil)
+		bind := ":8000"
+		log.Printf("Starting server on %s...", bind)
+		http.ListenAndServe(bind, nil)
 	}()
 }
 
