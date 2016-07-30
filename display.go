@@ -4,15 +4,22 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
 	"html"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 )
 
 type File struct {
 	FsPath  string
 	UrlPath string
+}
+
+type client struct {
+	conn *websocket.Conn
+	// TODO: mutex or channel for writing
 }
 
 type Display struct {
@@ -24,10 +31,14 @@ type Display struct {
 	upgrader *websocket.Upgrader
 
 	watcher *fsnotify.Watcher
+
+	clients []*client
+	// TODO: mutex for clients
 }
 
 func NewDisplay(bind string) *Display {
 	disp := &Display{}
+	disp.clients = make([]*client, 0)
 
 	// watcher setup
 	watcher, err := fsnotify.NewWatcher()
@@ -44,12 +55,6 @@ func NewDisplay(bind string) *Display {
 		Handler:      mux,
 		ReadTimeout:  1 * time.Second,
 		WriteTimeout: 1 * time.Second,
-	}
-
-	// websocket upgrader
-	disp.upgrader = &websocket.Upgrader{
-		ReadBufferSize:  2048,
-		WriteBufferSize: 2048,
 	}
 
 	// serve static files from html/ folder
@@ -75,6 +80,12 @@ func NewDisplay(bind string) *Display {
 		w.WriteHeader(http.StatusNotFound)
 	})
 
+	// websocket upgrader
+	disp.upgrader = &websocket.Upgrader{
+		ReadBufferSize:  2048,
+		WriteBufferSize: 2048,
+	}
+
 	// handle websocket connections
 	disp.mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[HTTP] %s %s\n", r.Method, html.EscapeString(r.URL.Path))
@@ -93,46 +104,159 @@ func NewDisplay(bind string) *Display {
 }
 
 func (disp *Display) Run() {
-	/*
-		// wait for file changes in background
-		go func() {
-			for {
-				select {
-				case evt := <-watcher.Events:
-					log.Println("Event: " + evt.String())
-					log.Printf("Evt in file '%s', command: 0x%x\n", evt.Name, evt.Op)
-
-				case err := <-watcher.Errors:
-					log.Print("Error: ")
-					log.Println(err)
-				}
-			}
-		}()
-
-		// add files to watch
-		err = watcher.Add(FN)
-		if err != nil {
-			log.Panic(err)
-		}
-	*/
+	disp.setupFileWatchers()
 
 	log.Printf("Starting server on %s...", disp.server.Addr)
 	disp.server.ListenAndServe()
 }
 
 func (disp *Display) handleWebsocket(conn *websocket.Conn) {
+	// Store connection handle
+	// TODO: Use mutex for disp.clients
+	c := &client{conn}
+	disp.clients = append(disp.clients, c)
+
+	// Wait for and handle messages
 	for {
 		messageType, p, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("WebSocket read error:")
+			log.Println("WebSocket read error (retiring socket):")
 			log.Println(err)
+			disp.removeConnection(conn)
 			return
 		}
 
+		// TODO: Use mutex for conn.WriteMessage
 		if err = conn.WriteMessage(messageType, p); err != nil {
-			log.Println("WebSocket write error:")
+			log.Println("WebSocket write error (retiring socket):")
 			log.Println(err)
+			disp.removeConnection(conn)
 			return
+		}
+	}
+}
+
+func (disp *Display) removeConnection(conn *websocket.Conn) {
+	// TODO: Use mutex for disp.clients
+	found := false
+	for i, v := range disp.clients {
+		if conn == v.conn {
+			disp.clients = append(disp.clients[:i], disp.clients[i+1:]...)
+			found = true
+			break
+		}
+	}
+	if !found {
+		log.Println("Couldn't find connection handle in list")
+		return
+	}
+}
+
+func (disp *Display) setupFileWatchers() {
+	// add files to watch
+	for _, f := range disp.Files {
+		err := disp.watcher.Add(f.FsPath)
+		if err != nil {
+			log.Panic(err)
+		}
+
+		go func() {
+			for {
+				select {
+				case event := <-disp.watcher.Events:
+					log.Println("Event in file " + event.String())
+
+					// event.Op:
+					// - WRITE	append or write to file
+					// - REMOVE	file got deleted
+					// - CHMOD	file got touched, chmod'ed, etc.
+					// - RENAME	file got renamed
+					//
+					// Typical text editor save sequence:
+					// RENAME, CHMOD, REMOVE (i.e. rename to '~file', stat, write to 'file')
+					// -> Try to readd file after RENAME or REMOVE
+					switch event.Op {
+					case fsnotify.Write:
+						// send update
+						go disp.handleFileUpdate(event.Name)
+					case fsnotify.Remove:
+						fallthrough
+					case fsnotify.Rename:
+						// remove file from watcher
+						if err := disp.watcher.Remove(event.Name); err != nil {
+							log.Printf("Error removing '%s' from watcher\n", event.Name)
+							break
+						}
+
+						go func() {
+							// wait a short amount of time, then try to readd file to watcher
+							time.Sleep(time.Millisecond * 100)
+
+							if err := disp.watcher.Add(event.Name); err != nil {
+								log.Printf("Error readding '%s' to watcher\n", event.Name)
+								return
+							}
+
+							// send update for readded file
+							disp.handleFileUpdate(event.Name)
+						}()
+					case fsnotify.Chmod:
+						// ignore
+					case fsnotify.Create:
+						// ignore, shouldn't happen for files
+					}
+
+				case err := <-disp.watcher.Errors:
+					log.Print("Watcher Error: ")
+					log.Println(err)
+				}
+			}
+		}()
+	}
+}
+
+func (disp *Display) handleFileUpdate(fn string) {
+	fn = filepath.Clean(fn)
+
+	// find corresponding File
+	var f *File
+	for _, cf := range disp.Files {
+		if filepath.Clean(cf.FsPath) == fn {
+			f = &cf
+			break
+		}
+	}
+	if f == nil {
+		log.Printf("Can't find file '%s' in list.\n", fn)
+		return
+	}
+
+	// prepare update
+	u := update{}
+	u.File = f.UrlPath
+
+	// read file
+	fh, err := os.Open(fn)
+	if err != nil {
+		log.Printf("Error opening file '%s':\n", fn)
+		log.Print(err)
+		return
+	}
+
+	arr, err := ioutil.ReadAll(fh)
+	if err != nil {
+		log.Printf("Error reading file '%s':\n", fn)
+		log.Print(err)
+		return
+	}
+	u.Content = string(arr)
+
+	// send update to all clients
+	for _, c := range disp.clients {
+		// TODO: Use mutex for conn.Write
+		if c.conn.WriteJSON(u) != nil {
+			log.Printf("Error sending file '%s' to websocket:\n", fn)
+			log.Print(err)
 		}
 	}
 }
