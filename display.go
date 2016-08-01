@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"github.com/fsnotify/fsnotify"
 	"github.com/gorilla/websocket"
 	"html"
@@ -133,17 +134,25 @@ func (disp *Display) handleWebsocket(conn *websocket.Conn) {
 	}()
 
 	// Wait for and handle messages
+	cmd := &command{}
 	for {
-		messageType, p, err := conn.ReadMessage()
+		msgType, msg, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("WebSocket read error (retiring socket):")
 			log.Println(err)
 			disp.removeConnection(conn)
 			return
 		}
+		log.Printf("Got websocket msg (type: %d): %s\n", msgType, msg)
 
-		log.Printf("Got websocket msg (type: %d): %s\n", messageType, p)
-		c.writer <- string(p)
+		// try to decode message as JSON
+		err = json.Unmarshal(msg, cmd)
+		if err != nil {
+			log.Println("Error parsing websocket msg as JSON. Ignoring.")
+			return
+		}
+
+		disp.handleFileUpdate(cmd.File, c)
 	}
 }
 
@@ -189,7 +198,7 @@ func (disp *Display) setupFileWatchers() {
 					switch event.Op {
 					case fsnotify.Write:
 						// send update
-						go disp.handleFileUpdate(event.Name)
+						go disp.handleFileUpdate(event.Name, nil)
 					case fsnotify.Remove:
 						fallthrough
 					case fsnotify.Rename:
@@ -209,7 +218,7 @@ func (disp *Display) setupFileWatchers() {
 							}
 
 							// send update for readded file
-							disp.handleFileUpdate(event.Name)
+							disp.handleFileUpdate(event.Name, nil)
 						}()
 					case fsnotify.Chmod:
 						// ignore
@@ -226,7 +235,10 @@ func (disp *Display) setupFileWatchers() {
 	}
 }
 
-func (disp *Display) handleFileUpdate(fn string) {
+// read file and send contents to clients
+// if client is not nil, send to this client only
+func (disp *Display) handleFileUpdate(fn string, client *client) {
+	_ = client
 	fn = filepath.Clean(fn)
 
 	// find corresponding File
@@ -261,6 +273,12 @@ func (disp *Display) handleFileUpdate(fn string) {
 		return
 	}
 	u.Content = string(arr)
+
+	if client != nil {
+		// send update to one client only
+		client.writer <- u
+		return
+	}
 
 	// send update to all clients
 	for _, c := range disp.clients {

@@ -1,18 +1,26 @@
 var FileView = React.createClass({
 
+  getInitialState: function () {
+    return {
+      content: ''
+    };
+  },
+
   render: function () {
     return (
       <div className="fileView">
         <h2>FileView for '{this.props.file}'</h2>
 
-        <pre>{this.props.content}</pre>
+        <pre>{this.state.content}</pre>
       </div>
     );
   },
 
   componentWillMount: function () {
-    console.log('componentWillMount');
+    var that = this;
+
     var ws = new WebSocket('ws://localhost:8000/ws');
+    ws.binaryType = 'arraybuffer';
 
     ws.onerror = function (err) {
       console.log('WebSocket error:');
@@ -20,19 +28,28 @@ var FileView = React.createClass({
     };
 
     ws.onopen = function () {
-      ws.send('ping');
+      var cmd = { file: that.props.file };
+      ws.send(JSON.stringify(cmd));
     };
 
     ws.onmessage = function (e) {
-      console.log('Got message: ' + e.data);
+      var update = JSON.parse(e.data);
+
+      console.log('Got update:');
+      console.log(update);
+
+      if (update.file != that.props.file) {
+        console.log('Discarded');
+        return;
+      }
+
+      that.setState({ content: update.content });
     };
 
     this.ws = ws;
   },
 
   componentDidMount: function () {
-    console.log('componentDidMount');
-
   },
 
 });
