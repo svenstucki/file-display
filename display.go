@@ -18,8 +18,8 @@ type File struct {
 }
 
 type client struct {
-	conn *websocket.Conn
-	// TODO: mutex or channel for writing
+	conn   *websocket.Conn
+	writer chan interface{}
 }
 
 type Display struct {
@@ -112,9 +112,25 @@ func (disp *Display) Run() {
 
 func (disp *Display) handleWebsocket(conn *websocket.Conn) {
 	// Store connection handle
+	c := &client{}
+	c.conn = conn
+	c.writer = make(chan interface{})
 	// TODO: Use mutex for disp.clients
-	c := &client{conn}
 	disp.clients = append(disp.clients, c)
+
+	// Handle concurrent writes to channel
+	go func() {
+		for v := range c.writer {
+			log.Println("WriteJSON to ws:")
+			log.Println(v)
+			if err := conn.WriteJSON(v); err != nil {
+				log.Println("WebSocket write error (retiring socket):")
+				log.Println(err)
+				disp.removeConnection(conn)
+				return
+			}
+		}
+	}()
 
 	// Wait for and handle messages
 	for {
@@ -126,13 +142,8 @@ func (disp *Display) handleWebsocket(conn *websocket.Conn) {
 			return
 		}
 
-		// TODO: Use mutex for conn.WriteMessage
-		if err = conn.WriteMessage(messageType, p); err != nil {
-			log.Println("WebSocket write error (retiring socket):")
-			log.Println(err)
-			disp.removeConnection(conn)
-			return
-		}
+		log.Printf("Got websocket msg (type: %d): %s\n", messageType, p)
+		c.writer <- string(p)
 	}
 }
 
@@ -253,10 +264,6 @@ func (disp *Display) handleFileUpdate(fn string) {
 
 	// send update to all clients
 	for _, c := range disp.clients {
-		// TODO: Use mutex for conn.Write
-		if c.conn.WriteJSON(u) != nil {
-			log.Printf("Error sending file '%s' to websocket:\n", fn)
-			log.Print(err)
-		}
+		c.writer <- u
 	}
 }
